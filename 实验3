@@ -1,0 +1,192 @@
+import os
+import cv2
+import random
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision.models as models
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+DATA_ROOT = "/kaggle/input/competitions/2026task3/detection"
+TRAIN_IMG_DIR = os.path.join(DATA_ROOT, "train")
+TEST_IMG_DIR = os.path.join(DATA_ROOT, "test")
+GT_CSV_PATH = os.path.join(DATA_ROOT, "fovea_localization_train_GT.csv")
+SAMPLE_SUB_PATH = os.path.join(DATA_ROOT, "sample_submission.csv")
+OUTPUT_CSV = "/kaggle/working/submission.csv"
+
+IMG_SIZE = 512
+BATCH_SIZE = 4
+EPOCHS = 80
+LR = 1e-3
+SEED = 42
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+
+set_seed(SEED)
+
+
+class FoveaDataset(Dataset):
+    def __init__(self, df, img_dir, transforms, is_test=False):
+        self.df = df.reset_index(drop=True)
+        self.img_dir = img_dir
+        self.transforms = transforms
+        self.is_test = is_test
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img_id_str = str(row["data"]).strip() 
+        img_name = img_id_str.zfill(4) + ".jpg"
+        img_path = os.path.join(self.img_dir, img_name)
+
+        img = cv2.imread(img_path)
+        if img is None:
+            raise RuntimeError(f"cv2 读图失败：{img_path}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        h, w = img.shape[:2]
+
+        if not self.is_test:
+            x = float(row["Fovea_X"])
+            y = float(row["Fovea_Y"])
+            target = np.array([x / w, y / h], dtype=np.float32)
+        else:
+            target = np.array([0.0, 0.0], dtype=np.float32)
+
+        if self.transforms:
+            aug = self.transforms(image=img)
+            img = aug["image"]
+
+        return img, torch.tensor(target), img_id_str, (h, w)
+
+
+train_transform = A.Compose([
+    A.Resize(IMG_SIZE, IMG_SIZE),
+    A.HorizontalFlip(p=0.5),
+    A.RandomBrightnessContrast(p=0.3),
+    A.GaussianBlur(p=0.2, blur_limit=(3, 5)),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2(),
+])
+
+test_transform = A.Compose([
+    A.Resize(IMG_SIZE, IMG_SIZE),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2(),
+])
+
+
+class FoveaRegressor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        backbone = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+        self.backbone = backbone.features
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.head = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(1280, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 2),
+            nn.Sigmoid(), 
+        )
+
+    def forward(self, x):
+        feat = self.backbone(x)
+        feat = self.avgpool(feat).flatten(1)
+        return self.head(feat)
+
+
+model = FoveaRegressor().to(device)
+criterion = nn.MSELoss()
+optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-5)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+train_gt = pd.read_csv(GT_CSV_PATH, dtype={"data": str})
+print("训练集样本数：", len(train_gt))
+print(train_gt.head())
+
+train_ds = FoveaDataset(train_gt, TRAIN_IMG_DIR, train_transform, is_test=False)
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                          num_workers=0, pin_memory=True)
+
+print("\nStart training ...")
+for ep in range(EPOCHS):
+    model.train()
+    total_loss = 0.0
+    pbar = tqdm(train_loader, desc=f"Epoch {ep+1}/{EPOCHS}")
+    for imgs, targets, _, _ in pbar:
+        imgs = imgs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+
+        pred = model(imgs)
+        loss = criterion(pred, targets)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        pbar.set_postfix(loss=f"{loss.item():.5f}")
+
+    scheduler.step()
+    avg_loss = total_loss / len(train_loader)
+    print(f"Epoch {ep+1}/{EPOCHS} | Avg MSE Loss: {avg_loss:.6f}")
+
+print("\nInference on test set ...")
+sample_sub = pd.read_csv(SAMPLE_SUB_PATH)
+test_ids_in_order = []
+seen = set()
+for name in sample_sub["ImageID"].tolist():
+    img_id = name.split("_Fovea_")[0]
+    if img_id not in seen:
+        seen.add(img_id)
+        test_ids_in_order.append(img_id)
+
+test_df = pd.DataFrame({"data": test_ids_in_order})
+test_ds = FoveaDataset(test_df, TEST_IMG_DIR, test_transform, is_test=True)
+test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=0)
+
+model.eval()
+pred_dict = {}
+with torch.no_grad():
+    for img, _, img_id, orig_size in tqdm(test_loader, desc="Inference"):
+        img = img.to(device)
+        pred_norm = model(img).cpu().numpy()[0]  # [x_norm, y_norm]
+        h_orig, w_orig = orig_size[0].item(), orig_size[1].item()
+        pred_x = float(pred_norm[0] * w_orig)
+        pred_y = float(pred_norm[1] * h_orig)
+        pred_dict[img_id[0]] = (pred_x, pred_y)
+
+sub_rows = []
+for img_id in test_ids_in_order:
+    px, py = pred_dict[img_id]
+    sub_rows.append({"ImageID": f"{img_id}_Fovea_X", "value": px})
+    sub_rows.append({"ImageID": f"{img_id}_Fovea_Y", "value": py})
+
+submission = pd.DataFrame(sub_rows)
+
+assert len(submission) == len(sample_sub), \
+    f"行数不一致：sub={len(submission)} vs sample={len(sample_sub)}"
+assert (submission["ImageID"].values == sample_sub["ImageID"].values).all(), \
+    "ImageID 顺序与 sample_sub 不一致！"
+
+submission.to_csv(OUTPUT_CSV, index=False)

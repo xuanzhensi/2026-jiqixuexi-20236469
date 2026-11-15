@@ -1,0 +1,172 @@
+import os
+import numpy as np
+import pandas as pd
+from PIL import Image
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, Subset
+from torchvision import transforms, models
+from torchvision.datasets import ImageFolder
+from sklearn.model_selection import StratifiedKFold
+from tqdm import tqdm
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE = 64
+EPOCHS = 15
+LR = 1e-3
+IMG_SIZE = 48
+NUM_CLASSES = 6
+
+OUTPUT_DIR = "/kaggle/working"
+
+class_to_label = {
+    "Angry":0,
+    "Fear":1,
+    "Happy":2,
+    "Sad":3,
+    "Surprise":4,
+    "Neutral":5
+}
+
+train_transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomRotation(degrees=10),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.ToTensor(),
+])
+
+val_test_transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+])
+
+TRAIN_DIR = "/kaggle/input/competitions/2026task2/fer_data/fer_data/train"
+TEST_DIR = "/kaggle/input/competitions/2026task2/fer_data/fer_data/test"
+
+class TestFaceDataset(Dataset):
+    def __init__(self, img_dir, transform=None, exts=(".jpg",".jpeg",".png",".bmp",".webp")):
+        self.img_dir = img_dir
+        self.transform = transform
+        self.img_names = sorted([
+            f for f in os.listdir(img_dir)
+            if os.path.isfile(os.path.join(img_dir, f)) and f.lower().endswith(exts)
+        ])
+        print(f"[TestFaceDataset] {img_dir} 读到 {len(self.img_names)} 张图片")
+
+    def __len__(self):
+        return len(self.img_names)
+
+    def __getitem__(self, idx):
+        name = self.img_names[idx]
+        path = os.path.join(self.img_dir, name)
+        try:
+            image = Image.open(path).convert("RGB")
+        except Exception as e:
+            print(f"[WARN] {name}: {e}")
+            image = Image.new("RGB", (IMG_SIZE, IMG_SIZE))
+        if self.transform:
+            image = self.transform(image)
+        return image, name
+
+def get_model(num_classes=6):
+    model = models.resnet18(weights=None)
+    fc_in = model.fc.in_features
+    model.fc = nn.Linear(fc_in, num_classes)
+    return model.to(DEVICE)
+
+def train_one_epoch(model, loader, criterion, optimizer):
+    model.train()
+    total_loss = 0
+    correct = 0
+    total = 0
+    pbar = tqdm(loader, desc="Train")
+    for imgs, labels in pbar:
+        imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+        optimizer.zero_grad()
+        outputs = model(imgs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        preds = torch.argmax(outputs, dim=1)
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
+        pbar.set_postfix({"loss":f"{loss.item():.3f}", "acc":f"{correct/total:.3f}"})
+    avg_loss = total_loss / len(loader)
+    avg_acc = correct / total
+    return avg_loss, avg_acc
+
+def val_one_epoch(model, loader, criterion):
+    model.eval()
+    total_loss = 0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        pbar = tqdm(loader, desc="Val")
+        for imgs, labels in pbar:
+            imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+            outputs = model(imgs)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item()
+            preds = torch.argmax(outputs, dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+            pbar.set_postfix({"loss":f"{loss.item():.3f}", "acc":f"{correct/total:.3f}"})
+    avg_loss = total_loss / len(loader)
+    avg_acc = correct / total
+    return avg_loss, avg_acc
+
+def run_single_fold():
+    full_train_ds = ImageFolder(root=TRAIN_DIR, transform=train_transform)
+    val_ds_base = ImageFolder(root=TRAIN_DIR, transform=val_test_transform)
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    targets = np.array(full_train_ds.targets)
+    for fold, (train_idx, val_idx) in enumerate(skf.split(np.arange(len(full_train_ds)), targets)):
+        train_subset = Subset(full_train_ds, train_idx)
+        val_subset = Subset(val_ds_base, val_idx)
+        train_loader = DataLoader(train_subset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_subset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+        model = get_model(NUM_CLASSES)
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(model.parameters(), lr=LR)
+        best_val_acc = 0
+        best_model_state = None
+        for epoch in range(EPOCHS):
+            train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer)
+            val_loss, val_acc = val_one_epoch(model, val_loader, criterion)
+            print(f"Epoch {epoch+1:2d} | Train Loss:{train_loss:.4f} Acc:{train_acc:.4f} | Val Loss:{val_loss:.4f} Acc:{val_acc:.4f}")
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_model_state = model.state_dict()
+        model.load_state_dict(best_model_state)
+        break
+    return model
+
+def predict_single_model(model):
+    test_dataset = TestFaceDataset(TEST_DIR, transform=val_test_transform)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    predictions = []
+    filenames = []
+    model.eval()
+    with torch.no_grad():
+        for imgs, names in tqdm(test_loader, desc="Predict"):
+            imgs = imgs.to(DEVICE)
+            outputs = model(imgs)
+            pred = torch.argmax(outputs, dim=1).cpu().numpy()
+            predictions.extend(pred)
+            filenames.extend(names)
+
+    submit_df = pd.DataFrame({
+        "ID": filenames,
+        "# Emotion": predictions
+    })
+    submit_path = os.path.join(OUTPUT_DIR, "submission.csv")
+    submit_df.to_csv(submit_path, index=False)
+    print(f"✅ 预测csv已保存至：{submit_path}，一共 {len(submit_df)} 行")
+    return submit_df
+
+if __name__ == "__main__":
+    model = run_single_fold()
+    df_submit = predict_single_model(model)

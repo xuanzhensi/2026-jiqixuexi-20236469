@@ -1,0 +1,127 @@
+import os
+import cv2
+import numpy as np
+import pandas as pd
+from PIL import Image
+import torch
+import torchvision.models as models
+import torchvision.transforms as transforms
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+IMG_SIZE = (224, 224)
+FEATURE_DIM = 2048 
+train_transform = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.3),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+    transforms.GaussianBlur(kernel_size=(3,3), sigma=(0.1, 2.0)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
+])
+
+test_transform = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
+])
+
+def get_feature_extractor():
+    resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+    for param in resnet.parameters():
+        param.requires_grad = False
+    feature_extractor = torch.nn.Sequential(*list(resnet.children())[:-1])
+    feature_extractor = feature_extractor.to(DEVICE)
+    feature_extractor.eval()  
+    return feature_extractor
+
+extractor = get_feature_extractor()
+
+def extract_image_feature(img_path, is_train=True):
+    img = Image.open(img_path).convert("RGB")
+    if is_train:
+        img_tensor = train_transform(img).unsqueeze(0).to(DEVICE)
+    else:
+        img_tensor = test_transform(img).unsqueeze(0).to(DEVICE)
+
+    with torch.no_grad():
+        feat = extractor(img_tensor)
+    feat = feat.squeeze().cpu().numpy()
+    return feat
+
+DATA_ROOT = "/kaggle/input/competitions/2026task1/dataset-for-task2/dataset-for-task2/train"
+
+def load_dataset(data_root):
+    features = []
+    labels = []
+    class_names = sorted(os.listdir(data_root))
+    print("类别列表：", class_names)
+
+    for cls_idx, cls_name in enumerate(class_names):
+        cls_dir = os.path.join(data_root, cls_name)
+        if not os.path.isdir(cls_dir):
+            continue
+        for fname in os.listdir(cls_dir):
+            if fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                img_path = os.path.join(cls_dir, fname)
+                try:
+                    feat_vec = extract_image_feature(img_path, is_train=True)
+                    features.append(feat_vec)
+                    labels.append(cls_idx)
+                except Exception as e:
+                    print(f"跳过损坏图片 {img_path}, err:{e}")
+    return np.array(features), np.array(labels), class_names
+
+X, y, class_names = load_dataset(DATA_ROOT)
+print("提取特征形状：", X.shape, "标签形状：", y.shape)
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+X_train, X_val, y_train, y_val = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+
+from sklearn.model_selection import GridSearchCV
+param_grid = {
+    "C": [1, 10, 50],
+    "gamma": ["scale", 0.001, 0.01],
+    "kernel": ["rbf"]
+}
+grid = GridSearchCV(SVC(), param_grid, cv=5, scoring="accuracy", n_jobs=-1)
+grid.fit(X_train, y_train)
+print("最优SVM参数：", grid.best_params_)
+clf = grid.best_estimator_
+
+y_pred_val = clf.predict(X_val)
+acc = accuracy_score(y_val, y_pred_val)
+print(f"验证集准确率: {acc:.4f}")
+TEST_FOLDER = "/kaggle/input/competitions/2026task1/dataset-for-task2/dataset-for-task2/test"
+
+all_img_files = sorted([f for f in os.listdir(TEST_FOLDER) if f.lower().endswith((".jpg", ".jpeg", ".png"))])
+test_ids = all_img_files
+category_preds = []
+
+for fname in test_ids:
+    img_path = os.path.join(TEST_FOLDER, fname)
+    try:
+        feat = extract_image_feature(img_path, is_train=False)
+        feat_scaled = scaler.transform(feat.reshape(1, -1))
+        pred_idx = clf.predict(feat_scaled)[0]
+        pred_class = class_names[pred_idx]
+        category_preds.append(pred_class)
+    except Exception as e:
+        print(f"图片读取失败 {fname}, err:{e}")
+        category_preds.append("ERROR")
+
+submission_df = pd.DataFrame({
+    "ID": test_ids,
+    "Category": category_preds
+})
+
+submission_df.to_csv("/kaggle/working/plant_class_result.csv", index=False, encoding="utf-8-sig")
